@@ -3,3 +3,15 @@ __pycache__/
 *.pyc
 .env
 .DS_Store
+.evn.example:# OpenAI API Configuration
+OPENAI_API_KEY=your_openai_key_here
+
+# ScrapeGraph Configuration
+SGAI_API_KEY=your_scrapegraph_key_here
+SGAI_API_URL=https://v2-api.scrapegraphai.com/api
+SGAI_TIMEOUT=120
+
+# SFG Configuration
+SFG_COMPANY_NAME=Strategy Financial Group
+SFG_DESCRIPTION=Registered Investment Advisor (RIA) specializing in retirement wealth management
+SFG_ACQUISITION_FOCUS=Southwest US RIAs with $50M-500M AUM
