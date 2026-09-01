@@ -226,10 +226,18 @@ def to_count(value: Any) -> float:
         return 0.0
 
 
-def build_candidates(df, mapping: Dict[str, Optional[str]], f: Dict[str, Any]) -> "pd.DataFrame":
-    """Filter the roster to qualifying wealth-management practices."""
+def build_candidates(df, mapping: Dict[str, Optional[str]], f: Dict[str, Any],
+                     stats: Optional[Dict[str, int]] = None) -> "pd.DataFrame":
+    """
+    Filter the roster to qualifying wealth-management practices.
+
+    `stats` is filled in with the intermediate counts so the email can report
+    them accurately — the in-state pool is NOT the national total, and saying
+    otherwise puts a wrong number in front of the reader every week.
+    """
     cols = mapping
     frame = df
+    stats = stats if stats is not None else {}
 
     if cols.get("firm_type"):
         types = frame[cols["firm_type"]].astype(str).str.strip()
@@ -238,6 +246,7 @@ def build_candidates(df, mapping: Dict[str, Optional[str]], f: Dict[str, Any]) -
     states = sorted({s for r in f["regions"] for s in REGION_STATES.get(r, [])})
     if states and cols.get("state"):
         frame = frame[frame[cols["state"]].astype(str).str.strip().str.upper().isin(states)]
+    stats["state_pool"] = len(frame)
 
     def money(key):
         col = cols.get(key)
@@ -261,7 +270,11 @@ def build_candidates(df, mapping: Dict[str, Optional[str]], f: Dict[str, Any]) -
     )
 
     frame = frame[(frame["_aum"] >= f["aum_min"]) & (frame["_aum"] <= f["aum_max"])]
+    stats["in_band"] = len(frame)
+
     frame = frame[(frame["_retail"] >= f["min_retail"]) & (frame["_clients"] >= f["min_clients"])]
+    stats["dropped_funds"] = stats["in_band"] - len(frame)
+    stats["qualifying"] = len(frame)
     return frame
 
 
@@ -334,9 +347,11 @@ def build_email(lists: Dict[str, List[Dict[str, Any]]], meta: Dict[str, Any]) ->
 Week of {meta['date']} &middot; {meta['regions']} &middot; ${meta['aum_min']:,.0f}M–${meta['aum_max']:,.0f}M
 </p>
 <p style="font:13px system-ui;color:#6b7280;margin:0 0 18px">
-{meta['qualifying']:,} qualifying practices from {meta['universe']:,} registered advisers in these states.
-Screened to at least {meta['min_retail']:.0f}% of AUM from individual clients and {meta['min_clients']}+ clients,
-which excludes hedge funds and pooled-vehicle managers. AUM, client counts and client mix are as filed on Form ADV.
+{meta['state_pool']:,} registered advisers in these states ({meta['universe']:,} nationally).
+{meta['in_band']:,} fall inside the AUM band; {meta['dropped_funds']:,} of those were dropped as fund managers
+(under {meta['min_retail']:.0f}% of AUM from individual clients, or fewer than {meta['min_clients']} clients),
+leaving <strong>{meta['qualifying']:,} qualifying practices</strong>.
+AUM, client counts and client mix are as filed on Form ADV.
 </p>
 {table_html("Ranked by AUM", "Largest practices inside the band. Tends to cluster at the ceiling.", lists["aum"])}
 {table_html("Ranked by client count", "Most individual client relationships — the deepest books.", lists["clients"])}
@@ -384,8 +399,10 @@ def main() -> int:
     roster = load_roster()
     log(f"roster: {roster['source'].rsplit('/', 1)[-1]} ({roster['registered']:,} registered)")
 
-    qualifying = build_candidates(roster["df"], roster["mapping"], filters)
-    log(f"qualifying practices: {len(qualifying):,}")
+    stats: Dict[str, int] = {}
+    qualifying = build_candidates(roster["df"], roster["mapping"], filters, stats)
+    log(f"in-state: {stats['state_pool']:,} | in-band: {stats['in_band']:,} | "
+        f"dropped as funds: {stats['dropped_funds']:,} | qualifying: {stats['qualifying']:,}")
 
     if qualifying.empty:
         log("no qualifying firms — sending nothing")
@@ -397,7 +414,9 @@ def main() -> int:
         "regions": ", ".join(filters["regions"]),
         "aum_min": filters["aum_min"], "aum_max": filters["aum_max"],
         "min_retail": filters["min_retail"], "min_clients": filters["min_clients"],
-        "qualifying": len(qualifying), "universe": roster["registered"],
+        "universe": roster["registered"],
+        "state_pool": stats["state_pool"], "in_band": stats["in_band"],
+        "dropped_funds": stats["dropped_funds"], "qualifying": stats["qualifying"],
         "source": roster["source"].rsplit("/", 1)[-1],
     }
     html = build_email(lists, meta)
