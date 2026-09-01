@@ -2,3 +2,10 @@ streamlit==1.40.1
 openai==1.58.1
 python-dotenv==1.0.0
 httpx==0.27.0
+# pandas ships transitively with streamlit, but this app imports it directly,
+# so declare it. openpyxl is required to read the SEC Form ADV .xlsx and is NOT
+# pulled in by anything else — without it the ADV load fails at runtime.
+# Left unpinned deliberately: Railway builds on Python 3.14, and pinning older
+# releases is what caused the pydantic-core wheel build failure previously.
+pandas
+openpyxl
