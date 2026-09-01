@@ -9,14 +9,23 @@ Deliberately self-contained: agent_sfg_acquisition.py is Streamlit-coupled
 The data logic here is a copy of the logic verified working in that app.
 
 Verified facts this relies on (do not "correct" without re-checking):
-  * The SEC publishes two rosters with misleading names. The one containing
-    REGISTERED advisers (448 cols, Firm Type "Registered", column 5F(2)(c)
-    holding total regulatory AUM) is the "-exempt.zip" file. The plain ".zip"
-    holds Exempt Reporting Advisers with no AUM at all. Naming is not stable
-    month to month, so the file is chosen by CONTENT, never by name.
+  * SEC ROSTER FILENAMES ARE NOT STABLE. This has now changed twice:
+      Aug 2026: ia08032026-exempt.zip  held the REGISTERED advisers (inverted),
+                ia08032026.zip         held the ERAs.
+      Sep 2026: ia09012026-registered.zip holds the REGISTERED advisers,
+                ia09012026-exempt.zip     holds the ERAs.  (naming now sane)
+    The August files were also later re-published with "_1" appended.
+    Because of this the roster is ALWAYS chosen by CONTENT — count the rows
+    whose Firm Type is not exempt/ERA — and never by filename. Do not add
+    logic that trusts a suffix.
+  * The registered roster is 448 columns with total regulatory AUM in
+    column 5F(2)(c). The ERA roster is ~173 columns with no AUM at all.
+    Both column layouts re-verified against the live September file.
   * Item 5.D letters: (a) individuals, (b) high-net-worth individuals,
     (f) pooled investment vehicles, (g) pension/profit-sharing plans.
     Sub-column (1) is a client count, (3) is AUM from that client type.
+  * NO COLUMN IN THE ROSTER NAMES A PERSON. Founder/principal names come from
+    the IAPD individual API via iapd.py, keyed on Organization CRD#.
 
 Env vars:
   RESEND_API_KEY   required
@@ -29,6 +38,7 @@ Env vars:
   REPORT_MIN_RETAIL / REPORT_MIN_CLIENTS  default 50 (%) / 25
   REPORT_TOP_N     default 10
   REPORT_DRY_RUN   "1" prints the HTML instead of sending
+  REPORT_NO_PEOPLE "1" skips IAPD principal lookup
 """
 
 import io
@@ -42,6 +52,8 @@ from typing import Any, Dict, List, Optional
 
 import httpx
 import pandas as pd
+
+import iapd
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -120,19 +132,42 @@ def wanted_column(col: Any) -> bool:
     )
 
 
-def candidate_urls(months_back: int = 3, max_day: int = 10) -> List[str]:
-    urls: List[str] = []
+# Every filename shape the SEC has used. "-registered.zip" is September's and
+# must stay first; "-exempt.zip" was August's registered roster despite the
+# name. The "_1" variants are the SEC's own re-publications. Which one holds
+# the registered advisers is decided by content, never by position here.
+SEC_SUFFIXES = (
+    "-registered.zip", "-exempt.zip", ".zip",
+    "-registered_1.zip", "-exempt_1.zip", "_1.zip",
+)
+
+
+def candidate_stamps(months_back: int = 3, max_day: int = 12) -> List[str]:
+    """Publication date stamps (MMDDYYYY), newest first."""
+    stamps: List[str] = []
     today = datetime.now()
     year, month = today.year, today.month
     for _ in range(months_back):
         for day in range(max_day, 0, -1):
-            stamp = f"{month:02d}{day:02d}{year}"
-            for suffix in ("-exempt.zip", ".zip"):
-                urls.append(f"{SEC_FILE_BASE}ia{stamp}{suffix}")
+            stamps.append(f"{month:02d}{day:02d}{year}")
         month -= 1
         if month == 0:
             month, year = 12, year - 1
-    return urls
+    return stamps
+
+
+def stamp_urls(stamp: str, primary_only: bool = False) -> List[str]:
+    """
+    URLs for one publication date.
+
+    `primary_only` limits probing to the three shapes the SEC actually
+    publishes on the day; the "_1" re-publications are only worth asking for
+    once a date is known to exist. Halves the probe count, which matters —
+    un-throttled probing past ~10 req/s is what made sec.gov answer 403 to
+    everything once before.
+    """
+    suffixes = SEC_SUFFIXES[:3] if primary_only else SEC_SUFFIXES
+    return [f"{SEC_FILE_BASE}ia{stamp}{s}" for s in suffixes]
 
 
 def registered_rows(df: "pd.DataFrame", mapping: Dict[str, Optional[str]]) -> int:
@@ -143,65 +178,89 @@ def registered_rows(df: "pd.DataFrame", mapping: Dict[str, Optional[str]]) -> in
     return int((~types.str.contains(r"exempt|\bERA\b", case=False, regex=True, na=False)).sum())
 
 
+def try_urls(client: "httpx.Client", urls: List[str]) -> Optional[Dict[str, Any]]:
+    """Download the given URLs and return the best registered roster among them."""
+    best = None
+    for url in urls:
+        try:
+            resp = client.get(url)
+            if resp.status_code != 200:
+                continue
+            with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
+                members = [n for n in zf.namelist() if n.lower().endswith((".csv", ".xlsx"))]
+                if not members:
+                    continue
+                raw = zf.read(members[0])
+            df = pd.read_csv(
+                io.BytesIO(raw), low_memory=False, encoding_errors="replace",
+                usecols=wanted_column, dtype=str,
+            )
+            mapping = detect_columns(list(df.columns))
+            n_reg = registered_rows(df, mapping)
+            log(f"{url.rsplit('/', 1)[-1]}: {len(df):,} rows, {n_reg:,} registered")
+            if n_reg > 0 and mapping.get("aum") and (best is None or n_reg > best["registered"]):
+                best = {"df": df, "mapping": mapping, "source": url, "registered": n_reg}
+        except Exception as e:
+            log(f"skip {url.rsplit('/', 1)[-1]}: {e}")
+    return best
+
+
 def load_roster() -> Dict[str, Any]:
-    """Download the SEC roster containing REGISTERED advisers, chosen by content."""
-    urls: List[str] = []
+    """
+    Download the SEC roster containing REGISTERED advisers, chosen by content.
+
+    Walks publication dates newest-first and only stops when a date actually
+    yields a registered roster with AUM. The previous version latched onto the
+    newest date that had ANY file and gave up there, which is how a month where
+    the ERA file publishes first silently produced an empty report.
+    """
     with httpx.Client(timeout=180, follow_redirects=True, headers=SEC_HEADERS) as client:
+        # A pin is a hint, not a contract. Try it and its siblings first, but
+        # fall through to discovery if it has gone stale — SEC has renamed
+        # these files twice, and a dead pin must not kill the whole report.
         if SEC_ADV_FILE_URL:
-            urls = [SEC_ADV_FILE_URL]
-        else:
-            newest_stamp = None
-            for url in candidate_urls():
-                stamp = (re.search(r"ia(\d{8})", url) or [None, ""])[1]
-                if newest_stamp and stamp != newest_stamp:
-                    break
+            stamp = (re.search(r"ia(\d{8})", SEC_ADV_FILE_URL) or [None, ""])[1]
+            pinned = [SEC_ADV_FILE_URL] + ([u for u in stamp_urls(stamp)
+                                            if u != SEC_ADV_FILE_URL] if stamp else [])
+            best = try_urls(client, pinned)
+            if best:
+                return best
+            log(f"pinned URL yielded no registered roster ({SEC_ADV_FILE_URL}); discovering")
+
+        checked = 0
+        for stamp in candidate_stamps():
+            live: List[str] = []
+            for url in stamp_urls(stamp, primary_only=True):
                 time.sleep(PROBE_DELAY)
+                checked += 1
                 try:
                     if client.head(url, timeout=15).status_code == 200:
-                        urls.append(url)
-                        newest_stamp = stamp
+                        live.append(url)
                 except Exception:
                     continue
-        if not urls:
-            raise RuntimeError("Could not locate a current SEC adviser roster.")
-
-        # Always fetch both siblings: the registered/exempt split is not
-        # predictable from the filename.
-        expanded = list(urls)
-        for url in list(urls):
-            stamp = (re.search(r"ia(\d{8})", url) or [None, ""])[1]
-            if stamp:
-                for suffix in ("-exempt.zip", ".zip"):
-                    sib = f"{SEC_FILE_BASE}ia{stamp}{suffix}"
-                    if sib not in expanded:
-                        expanded.append(sib)
-
-        best = None
-        for url in expanded:
-            try:
-                resp = client.get(url)
-                if resp.status_code != 200:
-                    continue
-                with zipfile.ZipFile(io.BytesIO(resp.content)) as zf:
-                    members = [n for n in zf.namelist() if n.lower().endswith((".csv", ".xlsx"))]
-                    if not members:
+            if not live:
+                continue
+            # This date exists. Now it is worth asking for the "_1" variants
+            # too, cheaply, in case the SEC re-published a corrected file.
+            for url in stamp_urls(stamp):
+                if url not in live:
+                    time.sleep(PROBE_DELAY)
+                    checked += 1
+                    try:
+                        if client.head(url, timeout=15).status_code == 200:
+                            live.append(url)
+                    except Exception:
                         continue
-                    raw = zf.read(members[0])
-                df = pd.read_csv(
-                    io.BytesIO(raw), low_memory=False, encoding_errors="replace",
-                    usecols=wanted_column, dtype=str,
-                )
-                mapping = detect_columns(list(df.columns))
-                n_reg = registered_rows(df, mapping)
-                log(f"{url.rsplit('/', 1)[-1]}: {len(df):,} rows, {n_reg:,} registered")
-                if n_reg > 0 and mapping.get("aum") and (best is None or n_reg > best["registered"]):
-                    best = {"df": df, "mapping": mapping, "source": url, "registered": n_reg}
-            except Exception as e:
-                log(f"skip {url.rsplit('/', 1)[-1]}: {e}")
+            log(f"stamp {stamp}: {len(live)} file(s) present")
+            best = try_urls(client, live)
+            if best:
+                return best
+            log(f"stamp {stamp} had files but no registered roster — trying older date")
 
-    if not best:
-        raise RuntimeError("No downloaded roster contained registered advisers with AUM.")
-    return best
+    raise RuntimeError(
+        f"No registered adviser roster found after probing {checked} URLs. "
+        "If every probe returned 403, sec.gov is rate-limiting this host."
+    )
 
 
 # ---------------------------------------------------------------------------
@@ -306,6 +365,32 @@ def rank(frame, mapping, by: str, top_n: int) -> List[Dict[str, Any]]:
 # Email
 # ---------------------------------------------------------------------------
 
+def principal_html(row: Dict[str, Any]) -> str:
+    """
+    One line naming the likely owner, always carrying its confidence.
+
+    Deliberately never renders a bare name. These people get cold-called, and a
+    guess presented as a fact is worse than an empty cell.
+    """
+    p = row.get("principal") or {}
+    name = str(p.get("name") or "").strip()
+    if not name:
+        return ("<div style='font:11px system-ui;color:#9ca3af'>"
+                "no registered rep found in IAPD</div>")
+
+    conf = p.get("confidence", "none")
+    label = iapd.CONFIDENCE_LABEL.get(conf, "")
+    color = iapd.CONFIDENCE_COLOR.get(conf, "#6b7280")
+    since = p.get("industry_since")
+    tenure = f" &middot; in industry since {since}" if since else ""
+    url = p.get("profile_url") or ""
+    shown = (f"<a href='{url}' style='color:{color};text-decoration:none'>{name}</a>"
+             if url else name)
+    return (f"<div style='font:12px system-ui;color:{color};margin-top:2px'>"
+            f"<strong>{shown}</strong>{tenure}"
+            f"<span style='color:#9ca3af'> &middot; {label}</span></div>")
+
+
 def table_html(title: str, note: str, rows: List[Dict[str, Any]]) -> str:
     if not rows:
         return f"<h2 style='font:600 16px system-ui;margin:28px 0 4px'>{title}</h2><p style='font:14px system-ui;color:#6b7280'>No firms matched.</p>"
@@ -324,6 +409,7 @@ def table_html(title: str, note: str, rows: List[Dict[str, Any]]) -> str:
         body += (
             f"<tr style='background:{bg}'>"
             f"<td style='padding:8px 10px;font:14px system-ui;color:#111827'>{name}"
+            f"{principal_html(r)}"
             f"<div style='font:11px system-ui;color:#9ca3af'>CRD {r['crd']}</div></td>"
             f"<td style='padding:8px 10px;font:13px system-ui;color:#4b5563'>{r['city']}, {r['state']}</td>"
             f"<td style='padding:8px 10px;font:14px system-ui;text-align:right;color:#111827'>${r['aum']:,.1f}M</td>"
@@ -361,6 +447,14 @@ AUM, client counts and client mix are as filed on Form ADV.
 </p>
 <p style="font:11px system-ui;color:#9ca3af;margin:8px 0 0">
 Source: SEC Form ADV, {meta['source']}. Figures are self-reported by each adviser.
+Names come from the firm's registered investment adviser representatives on IAPD.
+Form ADV does not disclose ownership, so the principal is inferred &mdash;
+<span style="color:{iapd.CONFIDENCE_COLOR['high']}">green</span> means the surname matches
+the firm name or the firm has one or two reps;
+<span style="color:{iapd.CONFIDENCE_COLOR['medium']}">amber</span> is the longest-tenured of a
+small team; grey is unresolved. Verify before you call.
+"In industry since" is the year that person entered the securities industry anywhere,
+not the year the firm was founded.
 </p>
 </div>"""
 
@@ -409,6 +503,26 @@ def main() -> int:
         return 0
 
     lists = {k: rank(qualifying, roster["mapping"], k, top_n) for k in ("aum", "clients", "pension")}
+
+    # Principal enrichment. Only the firms actually appearing in the email get
+    # looked up — the three lists overlap heavily, so this is typically ~20
+    # requests, not 361. Failure here degrades the email, it never kills it.
+    if os.getenv("REPORT_NO_PEOPLE", "").strip() != "1":
+        crds = [r["crd"] for lst in lists.values() for r in lst if r.get("crd")]
+        try:
+            cache = iapd.enrich_crds(crds, log=log)
+            for lst in lists.values():
+                for r in lst:
+                    r["principal"] = iapd.principal_for(r["firm"], r["crd"], cache)
+            named = {r["crd"] for lst in lists.values() for r in lst
+                     if (r.get("principal") or {}).get("name")}
+            high = {r["crd"] for lst in lists.values() for r in lst
+                    if (r.get("principal") or {}).get("confidence") == "high"}
+            log(f"principals: {len(named)} named, {len(high)} high-confidence, "
+                f"of {len(set(crds))} firms")
+        except Exception as e:
+            log(f"IAPD enrichment skipped: {e}")
+
     meta = {
         "date": datetime.now(timezone.utc).strftime("%d %b %Y"),
         "regions": ", ".join(filters["regions"]),
