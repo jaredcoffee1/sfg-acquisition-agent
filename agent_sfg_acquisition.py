@@ -16,6 +16,7 @@ import time
 import json
 from typing import Dict, Any, List, Optional
 from datetime import datetime
+import dataclasses
 from dataclasses import dataclass, asdict
 import streamlit as st
 from openai import OpenAI, AsyncOpenAI
@@ -23,6 +24,8 @@ from dotenv import load_dotenv
 import httpx
 import pandas as pd
 import csv
+
+import iapd
 
 # Load environment variables
 load_dotenv()
@@ -403,13 +406,19 @@ def candidate_adv_urls(months_back: int = 3, max_day: int = 10) -> List[str]:
     today = datetime.now()
     year, month = today.year, today.month
 
-    # VERIFIED against the live files (do not "correct" this ordering):
-    #   ia<date>-exempt.zip -> 448 cols, Firm Type "Registered", HAS 5F(2)(c) AUM
-    #   ia<date>.zip        -> 172 cols, Firm Type "ERA",        NO AUM at all
-    # The SEC's naming is the reverse of what it suggests. The "-exempt" file is
-    # the registered-adviser roster and is the one we want.
+    # SEC FILENAMES ARE NOT STABLE — verified against live files twice now:
+    #   Aug 2026: ia08032026-exempt.zip     = REGISTERED (448 cols, has 5F(2)(c))
+    #             ia08032026.zip            = ERA        (no AUM at all)
+    #             later re-published as the same names with "_1" appended
+    #   Sep 2026: ia09012026-registered.zip = REGISTERED (448 cols, has 5F(2)(c))
+    #             ia09012026-exempt.zip     = ERA        (~173 cols, no AUM)
+    # So probe every shape and let the CONTENT check below (registered_count)
+    # decide which one is the roster. Never trust the suffix.
     # "_0" variants were confirmed 404 and are not probed.
-    suffixes = ["-exempt.zip", ".zip"]
+    suffixes = [
+        "-registered.zip", "-exempt.zip", ".zip",
+        "-registered_1.zip", "-exempt_1.zip", "_1.zip",
+    ]
 
     for _ in range(months_back):
         for day in range(max_day, 0, -1):
@@ -449,7 +458,9 @@ def load_adv_dataset() -> Dict[str, Any]:
                 links = re.findall(
                     r'href="([^"]*ia\d{8}[^"]*\.(?:zip|xlsx))"', landing.text, re.IGNORECASE
                 )
-                links = [l for l in links if "exempt" not in l.lower()]
+                # Deliberately NOT filtering on "exempt" in the name. In August
+                # the "-exempt" file WAS the registered roster; filtering on the
+                # filename threw away the only usable file. Content decides.
                 if links:
                     def file_date(url: str):
                         m = re.search(r"ia(\d{2})(\d{2})(\d{4})", url)
@@ -540,13 +551,18 @@ def load_adv_dataset() -> Dict[str, Any]:
             stamp_match = re.search(r"ia(\d{8})", url)
             if not stamp_match:
                 continue
-            for suffix in ("-exempt.zip", ".zip"):
+            for suffix in ("-registered.zip", "-exempt.zip", ".zip",
+                           "-registered_1.zip", "-exempt_1.zip", "_1.zip"):
                 sibling = f"{SEC_FILE_BASE}ia{stamp_match.group(1)}{suffix}"
                 if sibling not in expanded:
                     expanded.append(sibling)
-        # Registered roster first, so it wins ties and is downloaded even if the
-        # existence probe only saw the ERA file.
-        found_urls = sorted(set(expanded), key=lambda u: 0 if "-exempt" in u else 1)
+        # Order is a download preference only — the winner is chosen on content
+        # further down. "-registered" first because that is September's name for
+        # the roster; a 404 costs one cheap request.
+        found_urls = sorted(
+            set(expanded),
+            key=lambda u: (0 if "-registered" in u else 1 if "-exempt" in u else 2, u),
+        )
 
         downloads: List[tuple] = []  # (url, bytes)
         for url in found_urls:
@@ -647,7 +663,12 @@ def load_adv_dataset() -> Dict[str, Any]:
 
     if scored and scored[0][0] > 0:
         n_reg, name, df, mapping = scored[0]
-        return {"df": df, "mapping": mapping, "source_url": found_url,
+        # Label with the file that actually won on content, not whichever
+        # download happened to come back first — otherwise the UI credits the
+        # wrong filename and the next person "corrects" the working logic.
+        winning_file = name.split(":", 1)[0]
+        source_url = next((u for (u, _) in downloads if u.endswith(winning_file)), found_url)
+        return {"df": df, "mapping": mapping, "source_url": source_url,
                 "rows": len(df), "member": name, "registered": n_reg,
                 "candidates": {n: c for (c, n, _, _) in scored}}
 
@@ -701,6 +722,17 @@ class RIATarget:
     founder_info: str = ""           # Additional founder background
     ceo_name: str = ""               # Current CEO
     ceo_info: str = ""               # CEO background
+
+    # Provenance for founder_name. Form ADV does not disclose ownership, so the
+    # principal is INFERRED from the firm's registered reps on IAPD. Carrying
+    # the confidence through to the UI is not optional — these names get
+    # cold-called and a confident wrong name is worse than a blank cell.
+    crd: str = ""                    # Organization CRD#, the IAPD join key
+    founder_source: str = ""         # "IAPD" | "Website" | ""
+    founder_confidence: str = ""     # high | medium | low | none
+    founder_basis: str = ""          # plain-English reason for the pick
+    founder_profile_url: str = ""    # IAPD individual summary page
+    firm_rep_count: int = 0          # registered IARs at the firm
 
     # Practice-shape metrics from Form ADV Item 5.D — what makes a firm an
     # acquirable wealth-management practice rather than a fund manager.
@@ -936,6 +968,7 @@ class CuratorAgent:
             client_count=int(candidate.get("client_count") or 0),
             retail_pct=float(candidate.get("retail_pct") or 0.0),
             pension_pct=float(candidate.get("pension_pct") or 0.0),
+            crd=str(candidate.get("crd") or ""),
             website=candidate.get("website", ""),
             notes=candidate.get("notes", ""),
             source=candidate.get("source", "SEC Form ADV"),
@@ -1020,6 +1053,55 @@ class CuratorAgent:
 
         return targets
 
+    def enrich_principals_from_iapd(self, targets: List[RIATarget]) -> List[RIATarget]:
+        """
+        Name the likely principal of each firm from its registered reps on IAPD.
+
+        Keyed on Organization CRD#, which came from the ADV roster, so there is
+        no name matching and nothing to hallucinate. Form ADV itself does not
+        disclose ownership — the SEC roster has 448 columns and none of them
+        names a person — so the OWNER here is inferred, and every target keeps
+        the confidence and the reason alongside the name.
+
+        Failures degrade one firm, never the run.
+        """
+        with_crd = [t for t in targets if t.crd]
+        if not with_crd:
+            return targets
+
+        progress = st.progress(0.0)
+        named = 0
+        for i, target in enumerate(with_crd):
+            try:
+                people = iapd.fetch_people(target.crd)
+                pick = iapd.pick_principal(target.firm_name, people)
+                target.firm_rep_count = pick["headcount"]
+                if pick["name"]:
+                    target.founder_name = pick["name"]
+                    target.founder_source = "IAPD"
+                    target.founder_confidence = pick["confidence"]
+                    target.founder_basis = pick["basis"]
+                    target.founder_profile_url = pick["profile_url"]
+                    if pick["industry_since"]:
+                        target.founder_info = (
+                            f"In the securities industry since {pick['industry_since']} "
+                            f"(not necessarily at this firm)."
+                        )
+                    named += 1
+            except Exception as e:
+                st.caption(f"IAPD lookup failed for {target.firm_name}: {e}")
+            finally:
+                time.sleep(iapd.IAPD_DELAY)
+                progress.progress((i + 1) / len(with_crd))
+        progress.empty()
+
+        no_crd = len(targets) - len(with_crd)
+        st.caption(
+            f"IAPD: named a principal at {named} of {len(with_crd)} firms"
+            + (f"; {no_crd} had no CRD in the filing" if no_crd else "")
+        )
+        return targets
+
     async def enrich_ria_profile(self, target: RIATarget) -> RIATarget:
         """
         Add deep founder/CEO/owner information via AI synthesis.
@@ -1055,11 +1137,21 @@ class CuratorAgent:
             else:
                 parsed = sg_extracted(enrich_result)
                 if parsed:
-                    target.founder_name = str(parsed.get("founder_name") or "")
+                    scraped_name = str(parsed.get("founder_name") or "").strip()
+                    # Title and background are useful colour regardless. The
+                    # NAME only replaces the IAPD pick when IAPD had nothing —
+                    # a page that says "Founder" beats our tenure guess, but it
+                    # must not silently overwrite a surname-matched principal.
                     target.founder_title = str(parsed.get("founder_title") or "")
                     target.founder_info = str(parsed.get("founder_background") or "")
                     target.ceo_name = str(parsed.get("ceo_name") or "")
                     target.ceo_info = str(parsed.get("ceo_background") or "")
+                    if scraped_name and target.founder_confidence in ("low", "none", ""):
+                        target.founder_name = scraped_name
+                        target.founder_source = "Website"
+                        target.founder_confidence = "medium"
+                        target.founder_basis = f"named as founder on {target.website}"
+                        target.founder_profile_url = ""
                 else:
                     st.warning(
                         f"No leadership data returned for {target.firm_name} — "
@@ -1105,30 +1197,38 @@ class CuratorAgent:
         # Stage 2: Name, city, state and AUM come straight from the filing.
         extracted_targets = [self.target_from_adv(c) for c in candidates]
 
-        # Stage 3: Enrich founder/CEO from each firm's own site — the one thing
-        # the ADV does not carry. Concurrency capped to avoid API throttling.
-        with_site = [t for t in extracted_targets if t.website]
-        without_site = [t for t in extracted_targets if not t.website]
-        if without_site:
-            st.caption(f"{len(without_site)} adviser(s) list no website in their ADV — leadership lookup skipped.")
+        # Stage 3: Principals from IAPD. This runs FIRST and covers every firm
+        # with a CRD — which is all of them — because it is keyed on the CRD we
+        # already hold, costs no API credits, and does not depend on the firm
+        # having a website or a readable /team page. Verified 01 Sep 2026:
+        # 40 of 40 qualifying firms returned reps.
+        st.info("👥 Identifying principals from IAPD...")
+        enriched_targets = self.enrich_principals_from_iapd(extracted_targets)
 
-        st.info("👥 Enriching founder/CEO information...")
-        enriched_targets = list(without_site)
-        max_concurrent = 5
-        progress = st.progress(0.0)
+        # Stage 4: Website scrape, ONLY where IAPD could not resolve an owner.
+        # Previously this ran against every firm's homepage and identified a
+        # founder roughly 1 time in 10, because bios live on /about and /team.
+        # Now it is a fallback for the unresolved tail, so the credits go where
+        # they can actually change an answer.
+        unresolved = [t for t in enriched_targets
+                      if t.website and t.founder_confidence in ("low", "none", "")]
+        if unresolved:
+            st.info(f"🌐 {len(unresolved)} firm(s) unresolved by IAPD — checking their sites...")
+            max_concurrent = 5
+            progress = st.progress(0.0)
+            for i in range(0, len(unresolved), max_concurrent):
+                batch = unresolved[i:i + max_concurrent]
+                # enrich_ria_profile mutates and returns the same object, so the
+                # results are already reflected in enriched_targets.
+                await asyncio.gather(*[self.enrich_ria_profile(t) for t in batch])
+                progress.progress(min(1.0, (i + len(batch)) / max(1, len(unresolved))))
+            progress.empty()
 
-        for i in range(0, len(with_site), max_concurrent):
-            batch = with_site[i:i + max_concurrent]
-            tasks = [self.enrich_ria_profile(t) for t in batch]
-            batch_results = await asyncio.gather(*tasks)
-            enriched_targets.extend(batch_results)
-            progress.progress(min(1.0, (i + len(batch)) / max(1, len(with_site))))
-
-        progress.empty()
-        found_founder = sum(1 for t in enriched_targets if t.founder_name)
+        named = sum(1 for t in enriched_targets if t.founder_name)
+        confident = sum(1 for t in enriched_targets if t.founder_confidence == "high")
         st.success(
             f"Enriched {len(enriched_targets)} targets — "
-            f"founder identified for {found_founder} of {len(with_site)} with a website."
+            f"{named} with a named principal, {confident} high-confidence."
         )
 
         # Stage 4: Save and return
@@ -1214,15 +1314,40 @@ class CuratorAgent:
             return []
 
         try:
-            df = pd.read_csv(self.curator_file)
+            # dtype=str: pandas otherwise reads CRD "306471" back as an int64
+            # and firm_rep_count as a float, which then fails the dataclass's
+            # own types and the table's column config. Coerce explicitly below.
+            df = pd.read_csv(self.curator_file, dtype=str, keep_default_na=True)
+
+            fields = {f.name: f.type for f in dataclasses.fields(RIATarget)}
+            int_fields = {"client_count", "firm_rep_count"}
+            float_fields = {"aum_numeric", "retail_pct", "pension_pct", "confidence_score"}
+
             targets = []
             for _, row in df.iterrows():
-                row_dict = row.to_dict()
-                # Handle NaN values
-                for key in row_dict:
-                    if pd.isna(row_dict[key]):
-                        row_dict[key] = 0.0 if key == "aum_numeric" or key == "confidence_score" else ""
-                targets.append(RIATarget(**row_dict))
+                raw = row.to_dict()
+                clean: Dict[str, Any] = {}
+                # Ignore columns the model no longer has, rather than throwing
+                # away the whole file on a schema change.
+                for key, value in raw.items():
+                    if key not in fields:
+                        continue
+                    if value is None or (isinstance(value, float) and pd.isna(value)) or pd.isna(value):
+                        value = ""
+                    text = str(value).strip()
+                    if key in int_fields:
+                        try:
+                            clean[key] = int(float(text)) if text else 0
+                        except ValueError:
+                            clean[key] = 0
+                    elif key in float_fields:
+                        try:
+                            clean[key] = float(text) if text else 0.0
+                        except ValueError:
+                            clean[key] = 0.0
+                    else:
+                        clean[key] = text
+                targets.append(RIATarget(**clean))
             return targets
         except Exception as e:
             st.error(f"Failed to load targets: {e}")
@@ -1770,7 +1895,15 @@ with tab2:
                 "Clients": target.client_count or "",
                 "Retail %": f"{target.retail_pct:.0f}%" if target.retail_pct else "",
                 "Pension %": f"{target.pension_pct:.0f}%" if target.pension_pct else "",
-                "Founder": target.founder_name,
+                # Never show a bare name. Form ADV does not disclose ownership,
+                # so this is inferred and the reader has to see how strongly.
+                "Principal": target.founder_name,
+                "Confidence": {
+                    "high": "🟢 likely", "medium": "🟡 probable",
+                    "low": "⚪ unresolved", "none": "", "": "",
+                }.get(target.founder_confidence, ""),
+                "Reps": target.firm_rep_count or "",
+                "IAPD": target.founder_profile_url,
                 "Status": target.research_status,
                 "Index": i
             })
@@ -1778,7 +1911,39 @@ with tab2:
         df_display = pd.DataFrame(display_data)
 
         # Display table
-        st.dataframe(df_display, use_container_width=True, hide_index=True)
+        st.dataframe(
+            df_display,
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "IAPD": st.column_config.LinkColumn("IAPD", display_text="profile"),
+                "Reps": st.column_config.NumberColumn(
+                    "Reps", help="Investment adviser reps registered at the firm"),
+                "Confidence": st.column_config.TextColumn(
+                    "Confidence",
+                    help="How the principal was identified. 🟢 surname matches the firm "
+                         "name, or the firm has 1-2 reps. 🟡 longest-tenured of a small "
+                         "team, or named on the firm's own site. ⚪ too many reps to "
+                         "resolve. Verify before contacting."),
+            },
+        )
+
+        with st.expander("How the principal is identified", expanded=False):
+            st.markdown(
+                "Form ADV **does not disclose ownership** — the SEC roster has 448 "
+                "columns and not one names a person. Principals here come from the "
+                "firm's registered investment adviser representatives on IAPD, keyed "
+                "on CRD, then ranked:\n\n"
+                "- 🟢 **likely** — the person's surname appears in the firm name, or "
+                "the firm has only one or two registered reps\n"
+                "- 🟡 **probable** — longest-tenured of a small team, or named as "
+                "founder on the firm's own website\n"
+                "- ⚪ **unresolved** — too many reps to single one out; the name shown "
+                "is just the longest-tenured\n\n"
+                "Years shown are when that person entered the securities industry "
+                "**anywhere** — not when the firm was founded, and not their tenure "
+                "at this firm. Confirm before you reach out."
+            )
 
         # Export buttons
         st.divider()
